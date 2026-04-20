@@ -1,4 +1,6 @@
 import re
+from typing import Optional, Tuple
+
 import pytest
 from playwright.sync_api import Page, expect
 
@@ -48,8 +50,27 @@ def get_priority_badges(page: Page) -> int:
     return page.locator("[class*='card__priority']").count()
 
 
+def parse_stats_metrics(body_text: str) -> Tuple[Optional[int], Optional[int], Optional[int]]:
+    flat = body_text.replace("\n", " ")
+    ma = re.search(r"ОДОБРЕНО\s*(\d+)\s*%", flat)
+    mr = re.search(r"ОТКЛОНЕНО\s*(\d+)\s*%", flat)
+    mt = re.search(r"СРЕДНЕЕ ВРЕМЯ\s*(\d+)", flat)
+    ap = int(ma.group(1)) if ma else None
+    rp = int(mr.group(1)) if mr else None
+    avg = int(mt.group(1)) if mt else None
+    return ap, rp, avg
+
+
 def sidebar_category_select(page: Page):
     return page.locator("aside select").first
+
+
+def sidebar_priority_select(page: Page):
+    return page.locator("aside select").nth(1)
+
+
+def search_by_title_input(page: Page):
+    return page.locator('input[placeholder*="Введите название"]')
 
 
 def sort_by_select(page: Page):
@@ -101,24 +122,31 @@ class TestPriceRangeFilter:
         wait_for_list(desktop_page)
 
         over = [p for p in get_prices(desktop_page) if p > max_price]
-        assert not over, (
-            f"[BUG-UI-007] Cards with price > {max_price} still visible: {over}. "
-            f"Filter adds +5000 to entered value before sending to API."
-        )
+        assert not over, f"[BUG-UI-013] Cards with price > {max_price} still visible: {over}."
 
-    def test_reset_button_restores_list(self, desktop_page: Page):
+    def test_reset_clears_filters_ui_state(self, desktop_page: Page):
         goto_list(desktop_page)
-        initial = card_count(desktop_page)
-
+        sidebar_category_select(desktop_page).select_option("5")
+        desktop_page.get_by_placeholder("До").fill("99999")
         desktop_page.locator("label[class*='urgentToggle']").click()
         wait_for_list(desktop_page)
-        assert card_count(desktop_page) <= initial
 
         desktop_page.locator("button[title='Сбросить все фильтры']").click()
         wait_for_list(desktop_page)
         wait_for_list(desktop_page)
 
-        assert card_count(desktop_page) >= initial
+        problems = []
+        if sidebar_category_select(desktop_page).input_value() != "":
+            problems.append("категория в сайдбаре не сброшена на «Все категории»")
+        if desktop_page.get_by_placeholder("До").input_value() != "":
+            problems.append("поле «До» не очищено")
+        urgent = desktop_page.locator("label[class*='urgentToggle'] input[type='checkbox']")
+        if urgent.is_checked():
+            problems.append("тоггл «Только срочные» остаётся включённым")
+        assert not problems, (
+            "[BUG-UI-017] Кнопка «Сбросить все фильтры» не возвращает UI к начальному состоянию: "
+            + "; ".join(problems)
+        )
 
     def test_min_price_input_accepts_number(self, desktop_page: Page):
         goto_list(desktop_page)
@@ -223,10 +251,7 @@ class TestUrgentToggle:
         total = card_count(desktop_page)
         badges = get_priority_badges(desktop_page)
         assert total > 0
-        assert badges == total, (
-            f"[BUG-UI-008] Only {badges}/{total} cards have 'Срочно' badge. "
-            f"Backend returns non-urgent items when priority=urgent filter is active."
-        )
+        assert badges == total, f"[BUG-UI-014] Only {badges}/{total} cards have 'Срочно' badge."
 
     def test_disabling_toggle_restores_list(self, desktop_page: Page):
         goto_list(desktop_page)
@@ -267,8 +292,7 @@ class TestStatsTimer:
         desktop_page.locator("button[aria-label='Включить автообновление']").click()
         desktop_page.wait_for_timeout(400)
         assert desktop_page.get_by_text("Обновление через:").is_visible(), (
-            "[BUG-UI-009] Timer did not restart after clicking 'Включить автообновление'. "
-            "Handler uses `n && (...)` — fires only when auto-update is already active."
+            "[BUG-UI-015] Timer did not restart after clicking 'Включить автообновление'."
         )
 
     def test_period_select_changes_data(self, desktop_page: Page):
@@ -354,14 +378,47 @@ class TestPriorityDropdown:
 
     def test_priority_dropdown_urgent_only(self, desktop_page: Page):
         goto_list(desktop_page)
-        desktop_page.get_by_label("Приоритет").select_option("urgent")
+        sidebar_priority_select(desktop_page).select_option("urgent")
         wait_for_list(desktop_page)
 
         total = card_count(desktop_page)
         badges = get_priority_badges(desktop_page)
         assert total > 0
         assert badges == total, (
-            f"[BUG-UI-018] Only {badges}/{total} cards have 'Срочно' badge "
-            f"when priority dropdown is set to 'urgent'. "
-            f"Backend ignores the priority parameter."
+            f"[BUG-UI-016] Only {badges}/{total} cards have 'Срочно' badge with priority=urgent."
+        )
+
+
+class TestSearchSlash:
+
+    def test_slash_can_be_typed_in_search_field(self, desktop_page: Page):
+        goto_list(desktop_page)
+        inp = search_by_title_input(desktop_page)
+        expect(inp).to_be_visible()
+        inp.click()
+        desktop_page.keyboard.type("часть1", delay=15)
+        desktop_page.keyboard.type("/", delay=15)
+        desktop_page.keyboard.type("часть2", delay=15)
+        assert "/" in inp.input_value(), (
+            "[BUG-UI-019] Символ «/» не вставляется в строку поиска при наборе с клавиатуры."
+        )
+
+
+class TestStatsMetrics:
+
+    def test_approved_and_rejected_shares_sum_to_100_percent(self, desktop_page: Page):
+        goto_stats(desktop_page)
+        approved, rejected, _ = parse_stats_metrics(desktop_page.locator("body").inner_text())
+        assert approved is not None and rejected is not None, "Не удалось распарсить проценты на /stats"
+        assert approved + rejected == 100, (
+            f"[BUG-UI-018] Одобрено + отклонено ≠ 100%: {approved}% + {rejected}% = {approved + rejected}%."
+        )
+
+    def test_average_moderation_time_is_plausible(self, desktop_page: Page):
+        goto_stats(desktop_page)
+        _, _, avg_min = parse_stats_metrics(desktop_page.locator("body").inner_text())
+        assert avg_min is not None, "Не удалось распарсить среднее время на /stats"
+        max_reasonable_minutes = 24 * 60
+        assert avg_min <= max_reasonable_minutes, (
+            f"[BUG-UI-018] Нереалистичное среднее время: {avg_min} мин (лимит {max_reasonable_minutes} мин)."
         )
